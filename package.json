@@ -1,0 +1,18 @@
+{
+  "name": "aurora-smp-status-bot",
+  "version": "1.0.0",
+  "description": "Bot de Discord para Aurora SMP: /estado y /online + panel opcional",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
