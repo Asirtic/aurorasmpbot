@@ -246,7 +246,7 @@ function buildEmbed(online, max) {
     .addFields(
       {
         name: '🔌 Conexión',
-        value: `**IP:** \`${MC_ADDRESS}\`\n**RCON:** \`${RCON_HOST}:${RCON_PORT}\``,
+        value: `**IP:** \`${MC_ADDRESS}\``,
         inline: true,
       },
       {
