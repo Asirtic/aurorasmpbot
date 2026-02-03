@@ -1,19 +1,45 @@
 import 'dotenv/config';
 import express from 'express';
-import net from 'net';
-import { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, ActivityType } from 'discord.js';
-import { status as mcStatus } from 'mc-server-utilities';
+import fs from 'fs';
+import path from 'path';
+import {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  REST,
+  Routes,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  PermissionsBitField,
+} from 'discord.js';
+
+// =====================
+// Config
+// =====================
+const DISCORD_INVITE_URL = 'https://discord.gg/yzZRu8yTF5';
 
 const {
   DISCORD_TOKEN,
   CLIENT_ID,
   GUILD_ID,
+
   MC_ADDRESS,
   MC_NAME = 'Aurora SMP',
+
   WEBSITE_URL,
+  STORE_URL,
+
   STATUS_CHANNEL_ID,
   STATUS_UPDATE_SECONDS = '60',
   PRESENCE_UPDATE_SECONDS = '60',
+
+  PANEL_THUMBNAIL_URL,
+  PANEL_BANNER_URL,
+
+  // Heartbeat via Discord (channel message JSON)
+  HEARTBEAT_CHANNEL_ID,
+  HEARTBEAT_STALE_SECONDS = '180',
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('Falta DISCORD_TOKEN en .env / variables de entorno');
@@ -21,27 +47,35 @@ if (!CLIENT_ID) throw new Error('Falta CLIENT_ID (Application ID) en .env / vari
 if (!GUILD_ID) throw new Error('Falta GUILD_ID (Server ID) en .env / variables de entorno');
 if (!MC_ADDRESS) throw new Error('Falta MC_ADDRESS (ip:puerto o dominio:puerto)');
 
-const MC_ADDR = MC_ADDRESS.trim();
+const STALE_SEC = Math.max(30, Number(HEARTBEAT_STALE_SECONDS || 180));
 
-// -------------------- HTTP keep-alive --------------------
+// =====================
+// HTTP health (no es obligatorio exponerlo, pero ayuda en logs)
+// =====================
 const app = express();
 app.get('/', (_req, res) => res.status(200).send('Aurora SMP bot OK'));
 app.get('/health', (_req, res) => res.status(200).json({ ok: true, service: 'aurora-smp-bot' }));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 HTTP listo en puerto ${PORT}`));
 
-// -------------------- Discord --------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// =====================
+// Discord client
+// =====================
+// Nota: Para leer el contenido del mensaje del heartbeat por fetchMessages, NO hace falta el intent de MessageContent
+// para eventos, pero en algunos casos Discord lo restringe. Recomendación: actívalo en Developer Portal.
+// Aquí incluimos MessageContent para evitar sorpresas.
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
 
 const commands = [
   { name: 'estado', description: 'Estado del servidor (online/offline, jugadores, versión).' },
-  { name: 'online', description: 'Cuántos jugadores hay online (conteo real).' },
-  {
-    name: 'panel',
-    description: 'Crea o reinicia un panel fijo en este canal (admin).',
-    default_member_permissions: '0',
-  },
+  { name: 'online', description: 'Lista de jugadores online (si está disponible).' },
+  { name: 'panel', description: 'Crea o reinicia el panel fijo en este canal (SOLO ADMIN).' },
 ];
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -51,173 +85,313 @@ async function registerCommands() {
   console.log('✅ Slash commands registrados/actualizados (guild).');
 }
 
-// -------------------- Utilidades --------------------
-function parseAddress(addr) {
-  const clean = (addr || '').trim();
-  if (!clean.includes(':')) return { host: clean, port: 25565 };
-  const [host, portRaw] = clean.split(':');
-  const port = Number(portRaw);
-  return { host, port: Number.isFinite(port) ? port : 25565 };
-}
+// =====================
+// Panel persistence
+// =====================
+const PANEL_STATE_FILE = path.join(process.cwd(), 'panel.json');
 
-function tcpProbe(host, port, timeoutMs = 2500) {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    const done = (ok, msg) => {
-      try { socket.destroy(); } catch {}
-      resolve({ ok, msg });
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once('connect', () => done(true, `✅ TCP OK ${host}:${port}`));
-    socket.once('timeout', () => done(false, `⏱️ TCP TIMEOUT ${host}:${port}`));
-    socket.once('error', (e) => done(false, `❌ TCP ERROR ${host}:${port} -> ${e?.code || e?.message || e}`));
-    socket.connect(port, host);
-  });
-}
-
-// Cache para no “parpadear” si falla una consulta puntual
-let lastGood = null;
-
-async function fetchServerStatus() {
-  const { host, port } = parseAddress(MC_ADDR);
-
-  // Diagnóstico simple de red (se imprime en logs)
-  const probe = await tcpProbe(host, port);
-  console.log('[PROBE]', probe.msg);
-
+function loadPanelState() {
   try {
-    // mc-server-utilities (fork) usa API muy similar a minecraft-server-util. :contentReference[oaicite:1]{index=1}
-    const res = await mcStatus(host, port, { timeout: 5000, enableSRV: true });
-
-    const data = {
-      online: true,
-      players: { online: res.players?.online ?? 0, max: res.players?.max ?? 0 },
-      version: res.version?.nameRaw ?? res.version?.name ?? 'Desconocida',
-      motd: { clean: [res.motd?.clean ?? ''] },
-    };
-
-    lastGood = data;
-    console.log('[MC OK]', { host, port, online: data.players.online, max: data.players.max, ver: data.version });
-    return data;
-  } catch (err) {
-    console.log('[MC FAIL]', { host, port, err: err?.message || err });
-
-    if (lastGood) return lastGood;
-    return { online: false };
+    if (!fs.existsSync(PANEL_STATE_FILE)) return null;
+    const parsed = JSON.parse(fs.readFileSync(PANEL_STATE_FILE, 'utf8'));
+    if (!parsed?.channelId || !parsed?.messageId) return null;
+    return parsed;
+  } catch {
+    return null;
   }
 }
 
-function buildEmbed(data) {
-  const online = Boolean(data?.online);
-  const playersOnline = data?.players?.online ?? 0;
-  const playersMax = data?.players?.max ?? 0;
-  const version = data?.version ?? 'Desconocida';
+function savePanelState(channelId, messageId) {
+  try {
+    fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify({ channelId, messageId }, null, 2));
+  } catch (e) {
+    console.error('No pude guardar panel.json:', e);
+  }
+}
 
-  const motdClean = Array.isArray(data?.motd?.clean)
-    ? data.motd.clean.join('\n').trim()
-    : null;
+// =====================
+// Helpers
+// =====================
+function normalizeUrl(u) {
+  if (!u) return null;
+  return u.startsWith('http://') || u.startsWith('https://') ? u : `https://${u}`;
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function makeBar(current, max, size = 14) {
+  const safeMax = max > 0 ? max : 1;
+  const filled = Math.round((current / safeMax) * size);
+  const f = clamp(filled, 0, size);
+  return '█'.repeat(f) + '░'.repeat(size - f);
+}
+
+// =====================
+// Heartbeat state (from Discord channel message JSON)
+// =====================
+const state = {
+  source: 'none',     // none | discord
+  lastUpdate: 0,
+  online: false,
+  playersOnline: 0,
+  playersMax: 0,
+  version: 'Desconocida',
+  motd: null,
+  list: [],
+};
+
+async function pullHeartbeatFromDiscord() {
+  if (!HEARTBEAT_CHANNEL_ID) return;
+
+  const channel = await client.channels.fetch(HEARTBEAT_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+
+  // Traemos el mensaje más reciente
+  const msgs = await channel.messages.fetch({ limit: 5 }).catch(() => null);
+  if (!msgs || msgs.size === 0) return;
+
+  // Elegimos el primero que parezca JSON (el plugin manda JSON plano)
+  const candidate = msgs.find(m => m.content && m.content.trim().startsWith('{')) || msgs.first();
+  if (!candidate?.content) return;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(candidate.content.trim());
+  } catch {
+    // Si viene en ```json ... ``` lo limpiamos
+    const cleaned = candidate.content.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
+    try { parsed = JSON.parse(cleaned); } catch { return; }
+  }
+
+  const online = Boolean(parsed.online);
+  state.source = 'discord';
+  state.lastUpdate = Number(parsed.t || parsed.time || Date.now()) || Date.now();
+  // si el plugin manda epoch seconds
+  if (state.lastUpdate < 10_000_000_000) state.lastUpdate *= 1000;
+
+  state.online = online;
+  state.playersOnline = Number(parsed.playersOnline ?? 0) || 0;
+  state.playersMax = Number(parsed.playersMax ?? 0) || 0;
+  state.version = String(parsed.version ?? 'Desconocida');
+  state.motd = parsed.motd ? String(parsed.motd).slice(0, 1000) : null;
+
+  const list = Array.isArray(parsed.list) ? parsed.list.map(x => String(x)).slice(0, 60) : [];
+  state.list = list;
+}
+
+// =====================
+// UI builders
+// =====================
+function buildButtons() {
+  const web = normalizeUrl(WEBSITE_URL);
+  const store = normalizeUrl(STORE_URL);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('💜 Discord').setURL(DISCORD_INVITE_URL),
+  );
+
+  if (web) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🌐 Web').setURL(web));
+  if (store) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🛒 Tienda').setURL(store));
+
+  row.addComponents(
+    new ButtonBuilder()
+      .setStyle(ButtonStyle.Link)
+      .setLabel(`📌 ${MC_ADDRESS}`)
+      .setURL(store || web || DISCORD_INVITE_URL),
+  );
+
+  return [row];
+}
+
+function buildEmbedFromState() {
+  const ageMs = Date.now() - (state.lastUpdate || 0);
+  const stale = state.source === 'discord' && ageMs > STALE_SEC * 1000;
+
+  const online = !stale && Boolean(state.online);
+  const playersOnline = !stale ? (state.playersOnline ?? 0) : 0;
+  const playersMax = state.playersMax ?? 0;
+  const version = state.version ?? 'Desconocida';
+
+  const motdClean = state.motd ? String(state.motd).trim() : null;
+  const list = Array.isArray(state.list) ? state.list.slice(0, 30) : [];
+
+  const statusLabel = stale
+    ? '🟠 NO VERIFICABLE'
+    : (online ? '🟢 ONLINE' : '🔴 OFFLINE');
+
+  const color = stale ? 0xf59e0b : (online ? 0x22c55e : 0xef4444);
+
+  const titleUrl = normalizeUrl(WEBSITE_URL) || normalizeUrl(STORE_URL) || DISCORD_INVITE_URL;
+
+  const desc = stale
+    ? `**Estado:** ${statusLabel}\n**Última señal:** <t:${Math.floor((state.lastUpdate || Date.now()) / 1000)}:R>\n**Jugadores (último):** \`${state.playersOnline ?? 0}/${playersMax}\``
+    : (online
+        ? `**Estado:** ${statusLabel}\n**Jugadores:** \`${playersOnline}/${playersMax}\`\n\`${makeBar(playersOnline, playersMax)}\``
+        : `**Estado:** ${statusLabel}\n**Jugadores:** \`0/${playersMax || '—'}\``);
 
   const embed = new EmbedBuilder()
+    .setColor(color)
     .setTitle(`📡 ${MC_NAME}`)
+    .setURL(titleUrl)
+    .setDescription(desc)
     .addFields(
-      { name: 'Estado', value: online ? '🟢 Online' : '🔴 Offline', inline: true },
-      { name: 'Jugadores', value: `${playersOnline}/${playersMax}`, inline: true },
-      { name: 'Versión', value: String(version), inline: true },
-      { name: 'Dirección', value: `\`${MC_ADDR}\``, inline: false },
+      {
+        name: '🔌 Conexión',
+        value: `**IP:** \`${MC_ADDRESS}\`\n**Versión:** \`${version}\``,
+        inline: true,
+      },
+      {
+        name: '🕒 Actualización',
+        value: `**Ahora:** <t:${Math.floor(Date.now() / 1000)}:R>\n**Fuente:** \`${state.source}\``,
+        inline: true,
+      },
     )
+    .setFooter({ text: 'Aurora SMP • Panel en vivo' })
     .setTimestamp(new Date());
 
-  if (WEBSITE_URL) embed.addFields({ name: 'Web', value: WEBSITE_URL, inline: false });
-  if (motdClean) embed.addFields({ name: 'MOTD', value: motdClean.slice(0, 900), inline: false });
+  if (PANEL_THUMBNAIL_URL) embed.setThumbnail(PANEL_THUMBNAIL_URL);
+  if (PANEL_BANNER_URL) embed.setImage(PANEL_BANNER_URL);
 
-  if (online) {
+  if (motdClean) {
     embed.addFields({
-      name: `Online (${playersOnline})`,
-      value: '✅ Conteo real. (La lista de nombres requiere Query o RCON.)',
+      name: '📝 MOTD',
+      value: '```' + motdClean.slice(0, 900) + '```',
       inline: false,
     });
   }
 
+  if (!stale && online) {
+    embed.addFields({
+      name: `👥 Online (${playersOnline})`,
+      value: list.length ? list.join(', ') : '_La lista no está disponible._',
+      inline: false,
+    });
+  }
+
+  const web = normalizeUrl(WEBSITE_URL);
+  const store = normalizeUrl(STORE_URL);
+  const links = [
+    `💜 Discord: ${DISCORD_INVITE_URL}`,
+    web ? `🌐 Web: ${web}` : null,
+    store ? `🛒 Tienda: ${store}` : null,
+  ].filter(Boolean);
+
+  embed.addFields({ name: '🔗 Enlaces', value: links.join('\n').slice(0, 1024), inline: false });
+
   return embed;
 }
 
-// -------------------- Panel fijo --------------------
-let panelMessageId = null;
+// =====================
+// Panel fixed message
+// =====================
+async function upsertPanel(forceChannelId = null, forceNew = false) {
+  const saved = loadPanelState();
+  const channelId = forceChannelId || saved?.channelId || STATUS_CHANNEL_ID;
+  const messageId = forceNew ? null : (saved?.messageId || null);
 
-async function upsertPanel() {
-  if (!STATUS_CHANNEL_ID) return;
+  if (!channelId) return;
 
-  const channel = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
+  const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
 
-  const data = await fetchServerStatus();
-  const embed = buildEmbed(data);
+  // refresh heartbeat before rendering
+  await pullHeartbeatFromDiscord();
 
-  if (panelMessageId) {
-    const msg = await channel.messages.fetch(panelMessageId).catch(() => null);
-    if (msg) return msg.edit({ embeds: [embed] });
+  const embed = buildEmbedFromState();
+  const components = buildButtons();
+
+  if (messageId) {
+    const msg = await channel.messages.fetch(messageId).catch(() => null);
+    if (msg) {
+      await msg.edit({ embeds: [embed], components });
+      savePanelState(channelId, msg.id);
+      return;
+    }
   }
 
-  const created = await channel.send({ embeds: [embed] });
-  panelMessageId = created.id;
+  const created = await channel.send({ embeds: [embed], components });
+  savePanelState(channelId, created.id);
 }
 
-// -------------------- Presencia --------------------
+// =====================
+// Presence
+// =====================
 async function updatePresence() {
-  const data = await fetchServerStatus();
-  const online = Boolean(data?.online);
-  const playersOnline = data?.players?.online ?? 0;
-  const playersMax = data?.players?.max ?? 0;
+  await pullHeartbeatFromDiscord();
 
+  const ageMs = Date.now() - (state.lastUpdate || 0);
+  const stale = state.source === 'discord' && ageMs > STALE_SEC * 1000;
+
+  const online = !stale && Boolean(state.online);
+  const playersOnline = !stale ? (state.playersOnline ?? 0) : 0;
+  const playersMax = state.playersMax ?? 0;
+
+  // El bot SIEMPRE verde (está vivo). Solo cambia el texto.
   client.user?.setPresence({
     activities: [
-      { name: online ? `${playersOnline}/${playersMax} online` : 'Servidor offline', type: ActivityType.Watching },
+      {
+        name: stale
+          ? `🟠 No verificable | ${MC_NAME}`
+          : (online ? `🟢 ${playersOnline}/${playersMax} | ${MC_NAME}` : `🔴 Offline | ${MC_NAME}`),
+        type: 3, // Watching
+      },
     ],
-    status: online ? 'online' : 'dnd',
+    status: 'online',
   });
 }
 
-// -------------------- Interactions --------------------
+// =====================
+// Interactions
+// =====================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
     if (interaction.commandName === 'estado') {
       await interaction.deferReply();
-      const data = await fetchServerStatus();
-      await interaction.editReply({ embeds: [buildEmbed(data)] });
+      await pullHeartbeatFromDiscord();
+      await interaction.editReply({ embeds: [buildEmbedFromState()] });
       return;
     }
 
     if (interaction.commandName === 'online') {
       await interaction.deferReply();
-      const data = await fetchServerStatus();
+      await pullHeartbeatFromDiscord();
 
-      if (!data?.online) {
-        await interaction.editReply('🔴 El servidor está offline (o no responde al ping).');
-        return;
-      }
+      const ageMs = Date.now() - (state.lastUpdate || 0);
+      const stale = state.source === 'discord' && ageMs > STALE_SEC * 1000;
 
-      const on = data?.players?.online ?? 0;
-      const mx = data?.players?.max ?? 0;
-      await interaction.editReply(`🟢 Hay **${on}/${mx}** jugadores online ahora mismo.`);
-      return;
+      if (stale) return interaction.editReply('🟠 Estado no verificable ahora mismo (sin señal reciente).');
+      if (!state.online) return interaction.editReply('🔴 El servidor está offline.');
+
+      const list = Array.isArray(state.list) ? state.list : [];
+      if (!list.length) return interaction.editReply('🟢 Online, pero no tengo lista de jugadores.');
+
+      const msg = `👥 Online (${list.length}): ${list.join(', ')}`;
+      return interaction.editReply(msg.length > 1900 ? msg.slice(0, 1900) + '…' : msg);
     }
 
     if (interaction.commandName === 'panel') {
-      const member = interaction.member;
-      const hasPerm =
-        member?.permissions?.has?.('ManageGuild') ||
-        member?.permissions?.has?.('Administrator');
+      // SOLO ADMINISTRADOR
+      const memberPerms = interaction.memberPermissions;
+      const isAdmin = memberPerms?.has(PermissionsBitField.Flags.Administrator);
 
-      if (!hasPerm) {
-        await interaction.reply({ content: '⛔ No tienes permisos para usar esto.', ephemeral: true });
+      if (!isAdmin) {
+        await interaction.reply({ content: '⛔ Solo administradores pueden usar `/panel`.', ephemeral: true });
         return;
       }
 
-      panelMessageId = null;
-      await interaction.reply({ content: '✅ Panel reiniciado.', ephemeral: true });
-      await upsertPanel();
+      const channel = interaction.channel;
+      if (!channel || !channel.isTextBased()) {
+        await interaction.reply({ content: '⚠️ No puedo usar este canal.', ephemeral: true });
+        return;
+      }
+
+      await interaction.reply({ content: '✅ Creando/Reiniciando panel en este canal...', ephemeral: true });
+      await upsertPanel(channel.id, true);
+      await interaction.editReply('✅ Panel listo. A partir de ahora se actualizará aquí.');
       return;
     }
   } catch (err) {
@@ -230,20 +404,24 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// =====================
+// Boot
+// =====================
 client.once('ready', async () => {
   console.log(`🤖 Bot listo como ${client.user.tag}`);
-  console.log('📌 MC_ADDRESS usado:', MC_ADDR);
 
   await registerCommands();
 
   const panelSec = Math.max(15, Number(STATUS_UPDATE_SECONDS || 60));
   const presSec = Math.max(15, Number(PRESENCE_UPDATE_SECONDS || 60));
 
+  // initial
   await upsertPanel();
   await updatePresence();
 
-  if (STATUS_CHANNEL_ID) setInterval(upsertPanel, panelSec * 1000);
-  setInterval(updatePresence, presSec * 1000);
+  // loops
+  setInterval(() => upsertPanel().catch(console.error), panelSec * 1000);
+  setInterval(() => updatePresence().catch(console.error), presSec * 1000);
 });
 
 client.login(DISCORD_TOKEN);
