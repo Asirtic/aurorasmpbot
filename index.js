@@ -24,7 +24,6 @@ const DISCORD_INVITE_URL = 'https://discord.gg/yzZRu8yTF5';
 const {
   DISCORD_TOKEN,
   CLIENT_ID,
-  GUILD_ID,
 
   MC_ADDRESS,
   MC_NAME = 'Aurora SMP',
@@ -43,14 +42,18 @@ const {
   RCON_HOST,
   RCON_PORT = '8056',
   RCON_PASSWORD,
+
+  // Multi-guild command registration
+  // Example: GUILD_IDS=7464...,1234...,5678...
+  GUILD_IDS,
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('Falta DISCORD_TOKEN');
 if (!CLIENT_ID) throw new Error('Falta CLIENT_ID');
-if (!GUILD_ID) throw new Error('Falta GUILD_ID');
 if (!MC_ADDRESS) throw new Error('Falta MC_ADDRESS');
 if (!RCON_HOST) throw new Error('Falta RCON_HOST');
 if (!RCON_PASSWORD) throw new Error('Falta RCON_PASSWORD');
+if (!GUILD_IDS) throw new Error('Falta GUILD_IDS (lista de IDs separados por coma)');
 
 // =====================
 // HTTP health
@@ -93,8 +96,9 @@ const commands = [
 ];
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+
 async function registerCommands() {
-  const list = String(process.env.GUILD_IDS || '')
+  const list = String(GUILD_IDS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
@@ -198,7 +202,7 @@ async function getCounts() {
 
   const key = `${parsed.online}/${parsed.max}`;
   if (key !== lastLogKey) {
-    console.log('[RCON CLEANED]', JSON.stringify(parsed.cleaned));
+    // Logs útiles sin exponer RCON en el panel
     console.log('[RCON PARSED]', parsed.online, parsed.max);
     lastLogKey = key;
   }
@@ -234,12 +238,8 @@ function buildButtons() {
 function buildEmbed(online, max) {
   const hasData = Number.isFinite(online) && Number.isFinite(max);
 
-  // Colores: morado aurora base, verde si hay datos y el server responde
-  const basePurple = 0x8b5bff;
   const okGreen = 0x22c55e;
   const warnOrange = 0xf59e0b;
-
-  const color = hasData ? okGreen : warnOrange;
 
   const titleUrl = normalizeUrl(WEBSITE_URL) || normalizeUrl(STORE_URL) || DISCORD_INVITE_URL;
 
@@ -248,7 +248,7 @@ function buildEmbed(online, max) {
     : `**Jugadores:** \`?\`\n_El servidor no respondió a RCON en este momento._`;
 
   const embed = new EmbedBuilder()
-    .setColor(hasData ? color : warnOrange)
+    .setColor(hasData ? okGreen : warnOrange)
     .setTitle(`📡 ${MC_NAME}`)
     .setURL(titleUrl)
     .setDescription(desc)
@@ -270,18 +270,13 @@ function buildEmbed(online, max) {
   if (PANEL_THUMBNAIL_URL) embed.setThumbnail(PANEL_THUMBNAIL_URL);
   if (PANEL_BANNER_URL) embed.setImage(PANEL_BANNER_URL);
 
-  if (WEBSITE_URL || STORE_URL) {
-    const links = [
-      `💜 Discord: ${DISCORD_INVITE_URL}`,
-      WEBSITE_URL ? `🌐 Web: ${normalizeUrl(WEBSITE_URL)}` : null,
-      STORE_URL ? `🛒 Tienda: ${normalizeUrl(STORE_URL)}` : null,
-    ].filter(Boolean);
+  const links = [
+    `💜 Discord: ${DISCORD_INVITE_URL}`,
+    WEBSITE_URL ? `🌐 Web: ${normalizeUrl(WEBSITE_URL)}` : null,
+    STORE_URL ? `🛒 Tienda: ${normalizeUrl(STORE_URL)}` : null,
+  ].filter(Boolean);
 
-    embed.addFields({ name: '🔗 Enlaces', value: links.join('\n').slice(0, 1024), inline: false });
-  }
-
-  // Un toque "Aurora" aunque usemos verde/amarillo: línea decorativa con morado en el footer/title ya ayuda.
-  // Si quieres, puedo ajustar todo a morado fijo.
+  embed.addFields({ name: '🔗 Enlaces', value: links.join('\n').slice(0, 1024), inline: false });
 
   return embed;
 }
@@ -350,8 +345,7 @@ async function updatePresence() {
 // =====================
 function requireAdmin(interaction) {
   const perms = interaction.memberPermissions;
-  const isAdmin = perms?.has(PermissionsBitField.Flags.Administrator);
-  return Boolean(isAdmin);
+  return Boolean(perms?.has(PermissionsBitField.Flags.Administrator));
 }
 
 // =====================
@@ -401,7 +395,7 @@ client.on('interactionCreate', async (interaction) => {
         const { online, max } = await getCounts();
         const value = (Number.isFinite(online) && Number.isFinite(max)) ? `${online}/${max}` : '?';
         await interaction.editReply(`👥 Jugadores online: **${value}**`);
-      } catch (e) {
+      } catch {
         await interaction.editReply('👥 Jugadores online: **?** (RCON no respondió)');
       }
       return;
@@ -435,7 +429,6 @@ client.on('interactionCreate', async (interaction) => {
 // =====================
 client.once('ready', async () => {
   console.log(`🤖 Bot listo como ${client.user.tag}`);
-  console.log(`📌 RCON -> ${RCON_HOST}:${RCON_PORT}`);
 
   await registerCommands();
 
