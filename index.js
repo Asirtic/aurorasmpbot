@@ -94,9 +94,13 @@ const commands = [
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 async function registerCommands() {
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log('✅ Slash commands registrados/actualizados (guild).');
-}
+  const list = String(process.env.GUILD_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.length) throw new Error('Falta GUILD_IDS en .env');
+
+  for (const gid of list) {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, gid), { body: commands });
+    console.log(`✅ Slash commands registrados en guild ${gid}`);
+  }
 
 // =====================
 // Panel persistence
