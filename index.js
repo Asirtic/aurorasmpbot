@@ -16,23 +16,23 @@ import {
 import { Rcon } from 'rcon-client';
 
 // =====================
-// Config
+// ENV
 // =====================
-const DEFAULT_DISCORD_INVITE_URL = 'https://discord.gg/yzZRu8yTF5';
-const DEFAULT_MODPACK_URL =
-  'https://www.mediafire.com/file/99efzf43samiq5s/aurorasmpbyasirticmodsv115.rar/file';
-
 const {
   DISCORD_TOKEN,
   CLIENT_ID,
+
+  // Multi-guild registration (comma separated)
+  GUILD_IDS,
 
   MC_ADDRESS,
   MC_NAME = 'Aurora SMP',
 
   WEBSITE_URL,
   STORE_URL,
+  DISCORD_INVITE_URL,   // opcional
 
-  // Auto-panel opcional (si lo pones, al arrancar intenta crear/actualizar panel ahí)
+  // Panel defaults (opcional)
   STATUS_CHANNEL_ID,
   STATUS_UPDATE_SECONDS = '60',
   PRESENCE_UPDATE_SECONDS = '60',
@@ -40,28 +40,24 @@ const {
   PANEL_THUMBNAIL_URL,
   PANEL_BANNER_URL,
 
-  // RCON (FUENTE REAL)
+  // Modpack link (Mediafire)
+  MODPACK_URL,
+
+  // RCON
   RCON_HOST,
   RCON_PORT = '8056',
   RCON_PASSWORD,
-
-  // Multi-guild registration
-  GUILD_IDS,
-
-  // Links override
-  DISCORD_INVITE_URL = DEFAULT_DISCORD_INVITE_URL,
-  MODPACK_URL = DEFAULT_MODPACK_URL,
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('Falta DISCORD_TOKEN');
 if (!CLIENT_ID) throw new Error('Falta CLIENT_ID');
+if (!GUILD_IDS) throw new Error('Falta GUILD_IDS (IDs separados por coma)');
 if (!MC_ADDRESS) throw new Error('Falta MC_ADDRESS');
 if (!RCON_HOST) throw new Error('Falta RCON_HOST');
 if (!RCON_PASSWORD) throw new Error('Falta RCON_PASSWORD');
-if (!GUILD_IDS) throw new Error('Falta GUILD_IDS (IDs separados por coma)');
 
 // =====================
-// HTTP health
+// HTTP keep-alive
 // =====================
 const app = express();
 app.get('/', (_req, res) => res.status(200).send('Aurora SMP bot OK'));
@@ -72,76 +68,80 @@ app.listen(PORT, () => console.log(`🌐 HTTP listo en puerto ${PORT}`));
 // =====================
 // Discord client (sin intents privilegiados)
 // =====================
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// ✅ Comandos públicos
+// =====================
+// Commands (PÚBLICOS)
+// =====================
 const commands = [
   { name: 'panel', description: 'Crea o reinicia el panel fijo en ESTE canal.' },
-  { name: 'estado', description: 'Muestra el panel de estado aquí.' },
+  { name: 'estado', description: 'Muestra el estado del servidor (embed).' },
   { name: 'online', description: 'Muestra cuántos jugadores hay online.' },
-  { name: 'rawlist', description: 'Devuelve el texto crudo de "list" por RCON (debug).' },
 ];
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
-// ✅ RESET + re-register para limpiar permisos cacheados antiguos en cada guild
-async function registerCommands() {
-  const list = String(GUILD_IDS || '')
+function parseGuildIds() {
+  return String(GUILD_IDS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
+}
 
-  if (!list.length) throw new Error('Falta GUILD_IDS en .env');
+async function registerCommands() {
+  const ids = parseGuildIds();
+  console.log(`🧾 Registrando comandos en ${ids.length} guild(s): ${ids.join(', ')}`);
 
-  for (const gid of list) {
-    // 1) borra comandos viejos (resetea permisos cacheados / restos)
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, gid), { body: [] });
-
-    // 2) registra los nuevos
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, gid), { body: commands });
-
-    console.log(`✅ Slash commands reseteados y registrados en guild ${gid}`);
+  for (const gid of ids) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, gid), { body: commands });
+      console.log(`✅ Commands OK en guild ${gid}`);
+    } catch (e) {
+      // ESTO ES CLAVE: si el bot NO está dentro de ese servidor, te dará 403 Missing Access
+      console.error(`❌ No pude registrar en guild ${gid}:`, e?.rawError || e?.message || e);
+    }
   }
 }
 
 // =====================
-// Panel persistence (1 panel por guild)
+// Panel persistence (POR GUILD)
 // =====================
-// panel.json:
-// { "byGuild": { "<guildId>": { "channelId": "...", "messageId": "..." } } }
 const PANEL_STATE_FILE = path.join(process.cwd(), 'panel.json');
 
+/**
+ * Estructura:
+ * {
+ *   "<guildId>": { "channelId": "...", "messageId": "..." },
+ *   "<guildId2>": { ... }
+ * }
+ */
 function loadPanelState() {
   try {
-    if (!fs.existsSync(PANEL_STATE_FILE)) return { byGuild: {} };
+    if (!fs.existsSync(PANEL_STATE_FILE)) return {};
     const parsed = JSON.parse(fs.readFileSync(PANEL_STATE_FILE, 'utf8'));
-    if (!parsed?.byGuild || typeof parsed.byGuild !== 'object') return { byGuild: {} };
-    return parsed;
+    return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
-    return { byGuild: {} };
+    return {};
   }
 }
 
-function savePanelState(allState) {
+function savePanelState(all) {
   try {
-    fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(allState, null, 2));
+    fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(all, null, 2));
   } catch (e) {
-    console.error('No pude guardar panel.json:', e);
+    console.error('No pude guardar panel.json:', e?.message || e);
   }
 }
 
-function getGuildPanel(guildId) {
-  const st = loadPanelState();
-  return st.byGuild?.[guildId] || null;
+function setPanelForGuild(guildId, channelId, messageId) {
+  const all = loadPanelState();
+  all[guildId] = { channelId, messageId };
+  savePanelState(all);
 }
 
-function setGuildPanel(guildId, channelId, messageId) {
-  const st = loadPanelState();
-  st.byGuild = st.byGuild || {};
-  st.byGuild[guildId] = { channelId, messageId };
-  savePanelState(st);
+function getPanelForGuild(guildId) {
+  const all = loadPanelState();
+  return all[guildId] || null;
 }
 
 // =====================
@@ -151,34 +151,31 @@ function normalizeUrl(u) {
   if (!u) return null;
   return u.startsWith('http://') || u.startsWith('https://') ? u : `https://${u}`;
 }
-
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
-
 function makeBar(current, max, size = 14) {
   const safeMax = max > 0 ? max : 1;
   const filled = Math.round((current / safeMax) * size);
   const f = clamp(filled, 0, size);
   return '█'.repeat(f) + '░'.repeat(size - f);
 }
-
 function cleanMinecraftText(s) {
   return String(s)
-    .replace(/\x1b\[[0-9;]*m/g, '') // ANSI
-    .replace(/§[0-9A-FK-OR]/gi, '') // Minecraft § codes
+    .replace(/\x1b\[[0-9;]*m/g, '')      // ANSI
+    .replace(/§[0-9A-FK-OR]/gi, '')     // Minecraft § codes
     .replace(/\r/g, '');
 }
 
 // =====================
-// RCON (fuente real de jugadores)
+// RCON
 // =====================
 async function rconSend(cmd) {
   const rcon = await Rcon.connect({
     host: RCON_HOST,
     port: Number(RCON_PORT),
     password: RCON_PASSWORD,
-    timeout: 5000,
+    timeout: 6000,
   });
 
   try {
@@ -193,58 +190,57 @@ function parseOnlineMaxFromList(raw) {
 
   // "Online Players 0/16: "
   let m = res.match(/Online Players\s*(\d+)\s*\/\s*(\d+)\s*:/i);
-  if (m) return { online: Number(m[1]), max: Number(m[2]), cleaned: res };
+  if (m) return { online: Number(m[1]), max: Number(m[2]) };
 
-  // Vanilla:
+  // Vanilla: "There are X of a max of Y players online"
   m = res.match(/There are\s+(\d+)\s+of a max of\s+(\d+)\s+players online/i);
-  if (m) return { online: Number(m[1]), max: Number(m[2]), cleaned: res };
+  if (m) return { online: Number(m[1]), max: Number(m[2]) };
 
-  // Fallback:
+  // fallback
   m = res.match(/(\d+)\s*\/\s*(\d+)/);
-  if (m) return { online: Number(m[1]), max: Number(m[2]), cleaned: res };
+  if (m) return { online: Number(m[1]), max: Number(m[2]) };
 
-  return { online: null, max: null, cleaned: res };
+  return { online: null, max: null };
 }
 
-let lastLogKey = '';
+let lastKey = '';
 async function getCounts() {
   const raw = await rconSend('list');
-  const parsed = parseOnlineMaxFromList(raw);
+  const { online, max } = parseOnlineMaxFromList(raw);
 
-  const key = `${parsed.online}/${parsed.max}`;
-  if (key !== lastLogKey) {
-    console.log('[RCON PARSED]', parsed.online, parsed.max);
-    lastLogKey = key;
+  const key = `${online}/${max}`;
+  if (key !== lastKey) {
+    console.log('[RCON PARSED]', online, max);
+    lastKey = key;
   }
-
-  return parsed;
+  return { online, max };
 }
 
 // =====================
-// UI builders
+// Buttons + Embed (bonito)
 // =====================
 function buildButtons() {
   const web = normalizeUrl(WEBSITE_URL);
   const store = normalizeUrl(STORE_URL);
+  const discord = normalizeUrl(DISCORD_INVITE_URL);
   const modpack = normalizeUrl(MODPACK_URL);
-  const invite = normalizeUrl(DISCORD_INVITE_URL);
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('💜 Discord').setURL(invite),
-  );
+  const row = new ActionRowBuilder();
 
+  if (discord) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('💜 Discord').setURL(discord));
   if (web) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🌐 Web').setURL(web));
   if (store) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🛒 Tienda').setURL(store));
   if (modpack) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('📦 Modpack').setURL(modpack));
 
+  // IP como “label”
   row.addComponents(
     new ButtonBuilder()
       .setStyle(ButtonStyle.Link)
       .setLabel(`📌 ${MC_ADDRESS}`)
-      .setURL(store || web || invite),
+      .setURL(store || web || discord || modpack || 'https://discord.com')
   );
 
-  return [row];
+  return row.components.length ? [row] : [];
 }
 
 function buildEmbed(online, max) {
@@ -253,7 +249,12 @@ function buildEmbed(online, max) {
   const okGreen = 0x22c55e;
   const warnOrange = 0xf59e0b;
 
-  const titleUrl = normalizeUrl(WEBSITE_URL) || normalizeUrl(STORE_URL) || normalizeUrl(DISCORD_INVITE_URL);
+  const titleUrl =
+    normalizeUrl(WEBSITE_URL) ||
+    normalizeUrl(STORE_URL) ||
+    normalizeUrl(DISCORD_INVITE_URL) ||
+    normalizeUrl(MODPACK_URL) ||
+    null;
 
   const desc = hasData
     ? `**Jugadores:** \`${online}/${max}\`\n\`${makeBar(online, max)}\``
@@ -262,7 +263,6 @@ function buildEmbed(online, max) {
   const embed = new EmbedBuilder()
     .setColor(hasData ? okGreen : warnOrange)
     .setTitle(`📡 ${MC_NAME}`)
-    .setURL(titleUrl)
     .setDescription(desc)
     .addFields(
       { name: '🔌 Conexión', value: `**IP:** \`${MC_ADDRESS}\``, inline: true },
@@ -271,38 +271,33 @@ function buildEmbed(online, max) {
     .setFooter({ text: 'Aurora SMP • Panel en vivo' })
     .setTimestamp(new Date());
 
+  if (titleUrl) embed.setURL(titleUrl);
   if (PANEL_THUMBNAIL_URL) embed.setThumbnail(PANEL_THUMBNAIL_URL);
   if (PANEL_BANNER_URL) embed.setImage(PANEL_BANNER_URL);
 
   const links = [
-    `💜 Discord: ${normalizeUrl(DISCORD_INVITE_URL)}`,
+    DISCORD_INVITE_URL ? `💜 Discord: ${normalizeUrl(DISCORD_INVITE_URL)}` : null,
     WEBSITE_URL ? `🌐 Web: ${normalizeUrl(WEBSITE_URL)}` : null,
     STORE_URL ? `🛒 Tienda: ${normalizeUrl(STORE_URL)}` : null,
     MODPACK_URL ? `📦 Modpack: ${normalizeUrl(MODPACK_URL)}` : null,
   ].filter(Boolean);
 
-  embed.addFields({ name: '🔗 Enlaces', value: links.join('\n').slice(0, 1024), inline: false });
+  if (links.length) embed.addFields({ name: '🔗 Enlaces', value: links.join('\n').slice(0, 1024), inline: false });
 
   return embed;
 }
 
 // =====================
-// Panel fixed message (1 por guild)
+// Panel update
 // =====================
-async function upsertPanel({ guildId, forceChannelId = null, forceNew = false } = {}) {
-  if (!guildId) return;
-
-  const saved = getGuildPanel(guildId);
-  const channelId = forceChannelId || saved?.channelId || STATUS_CHANNEL_ID;
-  const messageId = forceNew ? null : (saved?.messageId || null);
-
-  if (!channelId) return;
-
+async function upsertPanelInChannel(guildId, channelId, forceNew = false) {
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
 
-  let online = null, max = null;
+  const saved = getPanelForGuild(guildId);
+  const oldMessageId = !forceNew ? saved?.messageId : null;
 
+  let online = null, max = null;
   try {
     const data = await getCounts();
     online = data.online;
@@ -314,17 +309,27 @@ async function upsertPanel({ guildId, forceChannelId = null, forceNew = false } 
   const embed = buildEmbed(online, max);
   const components = buildButtons();
 
-  if (messageId) {
-    const msg = await channel.messages.fetch(messageId).catch(() => null);
+  if (oldMessageId) {
+    const msg = await channel.messages.fetch(oldMessageId).catch(() => null);
     if (msg) {
       await msg.edit({ embeds: [embed], components });
-      setGuildPanel(guildId, channelId, msg.id);
+      setPanelForGuild(guildId, channelId, msg.id);
       return;
     }
   }
 
   const created = await channel.send({ embeds: [embed], components });
-  setGuildPanel(guildId, channelId, created.id);
+  setPanelForGuild(guildId, channelId, created.id);
+}
+
+async function updateAllPanelsTick() {
+  const all = loadPanelState();
+  const entries = Object.entries(all);
+
+  for (const [guildId, { channelId }] of entries) {
+    if (!guildId || !channelId) continue;
+    await upsertPanelInChannel(guildId, channelId, false).catch(() => {});
+  }
 }
 
 // =====================
@@ -332,7 +337,6 @@ async function upsertPanel({ guildId, forceChannelId = null, forceNew = false } 
 // =====================
 async function updatePresence() {
   let online = null, max = null;
-
   try {
     const data = await getCounts();
     online = data.online;
@@ -348,7 +352,7 @@ async function updatePresence() {
 }
 
 // =====================
-// Interactions
+// Interactions (PÚBLICOS)
 // =====================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -359,21 +363,22 @@ client.on('interactionCreate', async (interaction) => {
       const guildId = interaction.guildId;
 
       if (!guildId) {
-        await interaction.reply({ content: '⚠️ Este comando solo funciona dentro de un servidor.', ephemeral: true });
+        await interaction.reply({ content: '⚠️ Este comando solo funciona en servidores (no en DM).', ephemeral: true });
         return;
       }
+
       if (!channel || !channel.isTextBased()) {
         await interaction.reply({ content: '⚠️ No puedo usar este canal.', ephemeral: true });
         return;
       }
 
-      await interaction.reply({ content: '✅ Panel creado/reiniciado en este canal.', ephemeral: true });
-      await upsertPanel({ guildId, forceChannelId: channel.id, forceNew: true });
+      await interaction.reply({ content: '✅ Panel creado/actualizado en este canal.', ephemeral: true });
+      await upsertPanelInChannel(guildId, channel.id, true);
       return;
     }
 
     if (interaction.commandName === 'estado') {
-      await interaction.deferReply({ ephemeral: false });
+      await interaction.deferReply({ ephemeral: true });
 
       let online = null, max = null;
       try {
@@ -398,20 +403,6 @@ client.on('interactionCreate', async (interaction) => {
       }
       return;
     }
-
-    if (interaction.commandName === 'rawlist') {
-      await interaction.deferReply({ ephemeral: true });
-
-      try {
-        const raw = await rconSend('list');
-        const cleaned = cleanMinecraftText(raw);
-        const msg = cleaned.length > 1900 ? cleaned.slice(0, 1900) + '…' : cleaned;
-        await interaction.editReply("```" + msg + "```");
-      } catch (e) {
-        await interaction.editReply(`No pude leer "list" por RCON: ${e?.message || e}`);
-      }
-      return;
-    }
   } catch (err) {
     console.error(err);
     if (interaction.deferred || interaction.replied) {
@@ -428,30 +419,22 @@ client.on('interactionCreate', async (interaction) => {
 client.once('ready', async () => {
   console.log(`🤖 Bot listo como ${client.user.tag}`);
 
+  // MUY IMPORTANTE: registra comandos y loguea si falla en un guild (missing access)
   await registerCommands();
+
+  // Si quieres que al arrancar cree un panel por defecto:
+  // - si STATUS_CHANNEL_ID existe, lo pone SOLO en ese canal del GUILD_ID que lo invoque con /panel,
+  // - pero aquí no sabemos el guild, así que esto solo sirve si ya existe panel.json.
+  // De todas formas, si quieres “autopanel” en un canal fijo, usa /panel una vez en ese canal.
 
   const panelSec = Math.max(15, Number(STATUS_UPDATE_SECONDS || 60));
   const presSec = Math.max(15, Number(PRESENCE_UPDATE_SECONDS || 60));
 
-  const guildIds = String(GUILD_IDS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  // Auto-panel por guild si hay STATUS_CHANNEL_ID
-  if (STATUS_CHANNEL_ID) {
-    for (const gid of guildIds) {
-      await upsertPanel({ guildId: gid }).catch(console.error);
-    }
-    setInterval(() => {
-      for (const gid of guildIds) {
-        upsertPanel({ guildId: gid }).catch(console.error);
-      }
-    }, panelSec * 1000);
-  }
-
   await updatePresence();
-  setInterval(() => updatePresence().catch(console.error), presSec * 1000);
+  setInterval(() => updateAllPanelsTick().catch(() => {}), panelSec * 1000);
+  setInterval(() => updatePresence().catch(() => {}), presSec * 1000);
+
+  console.log('✅ Loops activos: panel y presence.');
 });
 
 client.login(DISCORD_TOKEN);
