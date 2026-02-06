@@ -18,9 +18,8 @@ import { Rcon } from 'rcon-client';
 // =====================
 // Config
 // =====================
-const DISCORD_INVITE_URL = 'https://discord.gg/yzZRu8yTF5';
-const MODPACK_URL =
-  process.env.MODPACK_URL ||
+const DEFAULT_DISCORD_INVITE_URL = 'https://discord.gg/yzZRu8yTF5';
+const DEFAULT_MODPACK_URL =
   'https://www.mediafire.com/file/99efzf43samiq5s/aurorasmpbyasirticmodsv115.rar/file';
 
 const {
@@ -33,7 +32,7 @@ const {
   WEBSITE_URL,
   STORE_URL,
 
-  // Auto-panel opcional (si lo pones, al arrancar crea/actualiza panel ahí)
+  // Auto-panel opcional (si lo pones, al arrancar intenta crear/actualizar panel ahí)
   STATUS_CHANNEL_ID,
   STATUS_UPDATE_SECONDS = '60',
   PRESENCE_UPDATE_SECONDS = '60',
@@ -48,6 +47,10 @@ const {
 
   // Multi-guild registration
   GUILD_IDS,
+
+  // Links override
+  DISCORD_INVITE_URL = DEFAULT_DISCORD_INVITE_URL,
+  MODPACK_URL = DEFAULT_MODPACK_URL,
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('Falta DISCORD_TOKEN');
@@ -73,7 +76,7 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-// ✅ Comandos públicos (sin permisos de admin)
+// ✅ Comandos públicos
 const commands = [
   { name: 'panel', description: 'Crea o reinicia el panel fijo en ESTE canal.' },
   { name: 'estado', description: 'Muestra el panel de estado aquí.' },
@@ -83,6 +86,7 @@ const commands = [
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
+// ✅ RESET + re-register para limpiar permisos cacheados antiguos en cada guild
 async function registerCommands() {
   const list = String(GUILD_IDS || '')
     .split(',')
@@ -92,15 +96,20 @@ async function registerCommands() {
   if (!list.length) throw new Error('Falta GUILD_IDS en .env');
 
   for (const gid of list) {
+    // 1) borra comandos viejos (resetea permisos cacheados / restos)
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, gid), { body: [] });
+
+    // 2) registra los nuevos
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, gid), { body: commands });
-    console.log(`✅ Slash commands registrados en guild ${gid}`);
+
+    console.log(`✅ Slash commands reseteados y registrados en guild ${gid}`);
   }
 }
 
 // =====================
 // Panel persistence (1 panel por guild)
 // =====================
-// panel.json tendrá este formato:
+// panel.json:
 // { "byGuild": { "<guildId>": { "channelId": "...", "messageId": "..." } } }
 const PANEL_STATE_FILE = path.join(process.cwd(), 'panel.json');
 
@@ -182,7 +191,6 @@ async function rconSend(cmd) {
 function parseOnlineMaxFromList(raw) {
   const res = cleanMinecraftText(raw);
 
-  // BetterRTP/otros plugins:
   // "Online Players 0/16: "
   let m = res.match(/Online Players\s*(\d+)\s*\/\s*(\d+)\s*:/i);
   if (m) return { online: Number(m[1]), max: Number(m[2]), cleaned: res };
@@ -213,15 +221,16 @@ async function getCounts() {
 }
 
 // =====================
-// UI builders (estética tipo IA)
+// UI builders
 // =====================
 function buildButtons() {
   const web = normalizeUrl(WEBSITE_URL);
   const store = normalizeUrl(STORE_URL);
   const modpack = normalizeUrl(MODPACK_URL);
+  const invite = normalizeUrl(DISCORD_INVITE_URL);
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('💜 Discord').setURL(DISCORD_INVITE_URL),
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('💜 Discord').setURL(invite),
   );
 
   if (web) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🌐 Web').setURL(web));
@@ -232,7 +241,7 @@ function buildButtons() {
     new ButtonBuilder()
       .setStyle(ButtonStyle.Link)
       .setLabel(`📌 ${MC_ADDRESS}`)
-      .setURL(store || web || DISCORD_INVITE_URL),
+      .setURL(store || web || invite),
   );
 
   return [row];
@@ -244,7 +253,7 @@ function buildEmbed(online, max) {
   const okGreen = 0x22c55e;
   const warnOrange = 0xf59e0b;
 
-  const titleUrl = normalizeUrl(WEBSITE_URL) || normalizeUrl(STORE_URL) || DISCORD_INVITE_URL;
+  const titleUrl = normalizeUrl(WEBSITE_URL) || normalizeUrl(STORE_URL) || normalizeUrl(DISCORD_INVITE_URL);
 
   const desc = hasData
     ? `**Jugadores:** \`${online}/${max}\`\n\`${makeBar(online, max)}\``
@@ -256,16 +265,8 @@ function buildEmbed(online, max) {
     .setURL(titleUrl)
     .setDescription(desc)
     .addFields(
-      {
-        name: '🔌 Conexión',
-        value: `**IP:** \`${MC_ADDRESS}\``,
-        inline: true,
-      },
-      {
-        name: '🕒 Actualización',
-        value: `**Ahora:** <t:${Math.floor(Date.now() / 1000)}:R>`,
-        inline: true,
-      },
+      { name: '🔌 Conexión', value: `**IP:** \`${MC_ADDRESS}\``, inline: true },
+      { name: '🕒 Actualización', value: `**Ahora:** <t:${Math.floor(Date.now() / 1000)}:R>`, inline: true },
     )
     .setFooter({ text: 'Aurora SMP • Panel en vivo' })
     .setTimestamp(new Date());
@@ -274,7 +275,7 @@ function buildEmbed(online, max) {
   if (PANEL_BANNER_URL) embed.setImage(PANEL_BANNER_URL);
 
   const links = [
-    `💜 Discord: ${DISCORD_INVITE_URL}`,
+    `💜 Discord: ${normalizeUrl(DISCORD_INVITE_URL)}`,
     WEBSITE_URL ? `🌐 Web: ${normalizeUrl(WEBSITE_URL)}` : null,
     STORE_URL ? `🛒 Tienda: ${normalizeUrl(STORE_URL)}` : null,
     MODPACK_URL ? `📦 Modpack: ${normalizeUrl(MODPACK_URL)}` : null,
@@ -432,12 +433,12 @@ client.once('ready', async () => {
   const panelSec = Math.max(15, Number(STATUS_UPDATE_SECONDS || 60));
   const presSec = Math.max(15, Number(PRESENCE_UPDATE_SECONDS || 60));
 
-  // Auto-panel por guild (si STATUS_CHANNEL_ID existe, intenta crear/actualizar 1 por cada guild)
   const guildIds = String(GUILD_IDS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
 
+  // Auto-panel por guild si hay STATUS_CHANNEL_ID
   if (STATUS_CHANNEL_ID) {
     for (const gid of guildIds) {
       await upsertPanel({ guildId: gid }).catch(console.error);
