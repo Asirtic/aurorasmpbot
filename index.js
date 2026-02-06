@@ -11,7 +11,6 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  PermissionsBitField,
   ActivityType,
 } from 'discord.js';
 import { Rcon } from 'rcon-client';
@@ -20,6 +19,9 @@ import { Rcon } from 'rcon-client';
 // Config
 // =====================
 const DISCORD_INVITE_URL = 'https://discord.gg/yzZRu8yTF5';
+const MODPACK_URL =
+  process.env.MODPACK_URL ||
+  'https://www.mediafire.com/file/99efzf43samiq5s/aurorasmpbyasirticmodsv115.rar/file';
 
 const {
   DISCORD_TOKEN,
@@ -31,6 +33,7 @@ const {
   WEBSITE_URL,
   STORE_URL,
 
+  // Auto-panel opcional (si lo pones, al arrancar crea/actualiza panel ahí)
   STATUS_CHANNEL_ID,
   STATUS_UPDATE_SECONDS = '60',
   PRESENCE_UPDATE_SECONDS = '60',
@@ -43,8 +46,7 @@ const {
   RCON_PORT = '8056',
   RCON_PASSWORD,
 
-  // Multi-guild command registration
-  // Example: GUILD_IDS=7464...,1234...,5678...
+  // Multi-guild registration
   GUILD_IDS,
 } = process.env;
 
@@ -53,7 +55,7 @@ if (!CLIENT_ID) throw new Error('Falta CLIENT_ID');
 if (!MC_ADDRESS) throw new Error('Falta MC_ADDRESS');
 if (!RCON_HOST) throw new Error('Falta RCON_HOST');
 if (!RCON_PASSWORD) throw new Error('Falta RCON_PASSWORD');
-if (!GUILD_IDS) throw new Error('Falta GUILD_IDS (lista de IDs separados por coma)');
+if (!GUILD_IDS) throw new Error('Falta GUILD_IDS (IDs separados por coma)');
 
 // =====================
 // HTTP health
@@ -65,34 +67,18 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 HTTP listo en puerto ${PORT}`));
 
 // =====================
-// Discord client (SOLO Guilds -> sin intents privilegiados)
+// Discord client (sin intents privilegiados)
 // =====================
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-// ✅ Todos los comandos solo admins (además se valida abajo)
+// ✅ Comandos públicos (sin permisos de admin)
 const commands = [
-  {
-    name: 'panel',
-    description: 'Crea o reinicia el panel fijo en este canal (SOLO ADMIN).',
-    default_member_permissions: String(PermissionsBitField.Flags.Administrator),
-  },
-  {
-    name: 'estado',
-    description: 'Muestra el panel de estado (SOLO ADMIN).',
-    default_member_permissions: String(PermissionsBitField.Flags.Administrator),
-  },
-  {
-    name: 'online',
-    description: 'Muestra jugadores online (SOLO ADMIN).',
-    default_member_permissions: String(PermissionsBitField.Flags.Administrator),
-  },
-  {
-    name: 'rawlist',
-    description: 'Devuelve el texto crudo de "list" por RCON (SOLO ADMIN).',
-    default_member_permissions: String(PermissionsBitField.Flags.Administrator),
-  },
+  { name: 'panel', description: 'Crea o reinicia el panel fijo en ESTE canal.' },
+  { name: 'estado', description: 'Muestra el panel de estado aquí.' },
+  { name: 'online', description: 'Muestra cuántos jugadores hay online.' },
+  { name: 'rawlist', description: 'Devuelve el texto crudo de "list" por RCON (debug).' },
 ];
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -112,27 +98,41 @@ async function registerCommands() {
 }
 
 // =====================
-// Panel persistence
+// Panel persistence (1 panel por guild)
 // =====================
+// panel.json tendrá este formato:
+// { "byGuild": { "<guildId>": { "channelId": "...", "messageId": "..." } } }
 const PANEL_STATE_FILE = path.join(process.cwd(), 'panel.json');
 
 function loadPanelState() {
   try {
-    if (!fs.existsSync(PANEL_STATE_FILE)) return null;
+    if (!fs.existsSync(PANEL_STATE_FILE)) return { byGuild: {} };
     const parsed = JSON.parse(fs.readFileSync(PANEL_STATE_FILE, 'utf8'));
-    if (!parsed?.channelId || !parsed?.messageId) return null;
+    if (!parsed?.byGuild || typeof parsed.byGuild !== 'object') return { byGuild: {} };
     return parsed;
   } catch {
-    return null;
+    return { byGuild: {} };
   }
 }
 
-function savePanelState(channelId, messageId) {
+function savePanelState(allState) {
   try {
-    fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify({ channelId, messageId }, null, 2));
+    fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(allState, null, 2));
   } catch (e) {
     console.error('No pude guardar panel.json:', e);
   }
+}
+
+function getGuildPanel(guildId) {
+  const st = loadPanelState();
+  return st.byGuild?.[guildId] || null;
+}
+
+function setGuildPanel(guildId, channelId, messageId) {
+  const st = loadPanelState();
+  st.byGuild = st.byGuild || {};
+  st.byGuild[guildId] = { channelId, messageId };
+  savePanelState(st);
 }
 
 // =====================
@@ -142,19 +142,22 @@ function normalizeUrl(u) {
   if (!u) return null;
   return u.startsWith('http://') || u.startsWith('https://') ? u : `https://${u}`;
 }
+
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
+
 function makeBar(current, max, size = 14) {
   const safeMax = max > 0 ? max : 1;
   const filled = Math.round((current / safeMax) * size);
   const f = clamp(filled, 0, size);
   return '█'.repeat(f) + '░'.repeat(size - f);
 }
+
 function cleanMinecraftText(s) {
   return String(s)
-    .replace(/\x1b\[[0-9;]*m/g, '')      // ANSI
-    .replace(/§[0-9A-FK-OR]/gi, '')     // Minecraft § codes
+    .replace(/\x1b\[[0-9;]*m/g, '') // ANSI
+    .replace(/§[0-9A-FK-OR]/gi, '') // Minecraft § codes
     .replace(/\r/g, '');
 }
 
@@ -179,7 +182,7 @@ async function rconSend(cmd) {
 function parseOnlineMaxFromList(raw) {
   const res = cleanMinecraftText(raw);
 
-  // Tu formato real:
+  // BetterRTP/otros plugins:
   // "Online Players 0/16: "
   let m = res.match(/Online Players\s*(\d+)\s*\/\s*(\d+)\s*:/i);
   if (m) return { online: Number(m[1]), max: Number(m[2]), cleaned: res };
@@ -188,7 +191,7 @@ function parseOnlineMaxFromList(raw) {
   m = res.match(/There are\s+(\d+)\s+of a max of\s+(\d+)\s+players online/i);
   if (m) return { online: Number(m[1]), max: Number(m[2]), cleaned: res };
 
-  // Último recurso:
+  // Fallback:
   m = res.match(/(\d+)\s*\/\s*(\d+)/);
   if (m) return { online: Number(m[1]), max: Number(m[2]), cleaned: res };
 
@@ -202,7 +205,6 @@ async function getCounts() {
 
   const key = `${parsed.online}/${parsed.max}`;
   if (key !== lastLogKey) {
-    // Logs útiles sin exponer RCON en el panel
     console.log('[RCON PARSED]', parsed.online, parsed.max);
     lastLogKey = key;
   }
@@ -216,6 +218,7 @@ async function getCounts() {
 function buildButtons() {
   const web = normalizeUrl(WEBSITE_URL);
   const store = normalizeUrl(STORE_URL);
+  const modpack = normalizeUrl(MODPACK_URL);
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('💜 Discord').setURL(DISCORD_INVITE_URL),
@@ -223,8 +226,8 @@ function buildButtons() {
 
   if (web) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🌐 Web').setURL(web));
   if (store) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🛒 Tienda').setURL(store));
+  if (modpack) row.addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('📦 Modpack').setURL(modpack));
 
-  // Discord no permite "abrir minecraft://" así que este botón solo muestra la IP como label
   row.addComponents(
     new ButtonBuilder()
       .setStyle(ButtonStyle.Link)
@@ -274,6 +277,7 @@ function buildEmbed(online, max) {
     `💜 Discord: ${DISCORD_INVITE_URL}`,
     WEBSITE_URL ? `🌐 Web: ${normalizeUrl(WEBSITE_URL)}` : null,
     STORE_URL ? `🛒 Tienda: ${normalizeUrl(STORE_URL)}` : null,
+    MODPACK_URL ? `📦 Modpack: ${normalizeUrl(MODPACK_URL)}` : null,
   ].filter(Boolean);
 
   embed.addFields({ name: '🔗 Enlaces', value: links.join('\n').slice(0, 1024), inline: false });
@@ -282,10 +286,12 @@ function buildEmbed(online, max) {
 }
 
 // =====================
-// Panel fixed message
+// Panel fixed message (1 por guild)
 // =====================
-async function upsertPanel(forceChannelId = null, forceNew = false) {
-  const saved = loadPanelState();
+async function upsertPanel({ guildId, forceChannelId = null, forceNew = false } = {}) {
+  if (!guildId) return;
+
+  const saved = getGuildPanel(guildId);
   const channelId = forceChannelId || saved?.channelId || STATUS_CHANNEL_ID;
   const messageId = forceNew ? null : (saved?.messageId || null);
 
@@ -311,17 +317,17 @@ async function upsertPanel(forceChannelId = null, forceNew = false) {
     const msg = await channel.messages.fetch(messageId).catch(() => null);
     if (msg) {
       await msg.edit({ embeds: [embed], components });
-      savePanelState(channelId, msg.id);
+      setGuildPanel(guildId, channelId, msg.id);
       return;
     }
   }
 
   const created = await channel.send({ embeds: [embed], components });
-  savePanelState(channelId, created.id);
+  setGuildPanel(guildId, channelId, created.id);
 }
 
 // =====================
-// Presence (siempre verde, solo cambia texto)
+// Presence
 // =====================
 async function updatePresence() {
   let online = null, max = null;
@@ -341,41 +347,32 @@ async function updatePresence() {
 }
 
 // =====================
-// Admin check (para TODOS los comandos)
-// =====================
-function requireAdmin(interaction) {
-  const perms = interaction.memberPermissions;
-  return Boolean(perms?.has(PermissionsBitField.Flags.Administrator));
-}
-
-// =====================
 // Interactions
 // =====================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // ✅ BLOQUEO TOTAL a no-admins
-  if (!requireAdmin(interaction)) {
-    await interaction.reply({ content: '⛔ Solo administradores pueden usar estos comandos.', ephemeral: true });
-    return;
-  }
-
   try {
     if (interaction.commandName === 'panel') {
       const channel = interaction.channel;
+      const guildId = interaction.guildId;
+
+      if (!guildId) {
+        await interaction.reply({ content: '⚠️ Este comando solo funciona dentro de un servidor.', ephemeral: true });
+        return;
+      }
       if (!channel || !channel.isTextBased()) {
         await interaction.reply({ content: '⚠️ No puedo usar este canal.', ephemeral: true });
         return;
       }
 
-      await interaction.reply({ content: '✅ Creando/Reiniciando panel en este canal...', ephemeral: true });
-      await upsertPanel(channel.id, true);
-      await interaction.editReply('✅ Panel listo. A partir de ahora se actualizará aquí.');
+      await interaction.reply({ content: '✅ Panel creado/reiniciado en este canal.', ephemeral: true });
+      await upsertPanel({ guildId, forceChannelId: channel.id, forceNew: true });
       return;
     }
 
     if (interaction.commandName === 'estado') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ ephemeral: false });
 
       let online = null, max = null;
       try {
@@ -435,10 +432,24 @@ client.once('ready', async () => {
   const panelSec = Math.max(15, Number(STATUS_UPDATE_SECONDS || 60));
   const presSec = Math.max(15, Number(PRESENCE_UPDATE_SECONDS || 60));
 
-  await upsertPanel();
-  await updatePresence();
+  // Auto-panel por guild (si STATUS_CHANNEL_ID existe, intenta crear/actualizar 1 por cada guild)
+  const guildIds = String(GUILD_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
-  setInterval(() => upsertPanel().catch(console.error), panelSec * 1000);
+  if (STATUS_CHANNEL_ID) {
+    for (const gid of guildIds) {
+      await upsertPanel({ guildId: gid }).catch(console.error);
+    }
+    setInterval(() => {
+      for (const gid of guildIds) {
+        upsertPanel({ guildId: gid }).catch(console.error);
+      }
+    }, panelSec * 1000);
+  }
+
+  await updatePresence();
   setInterval(() => updatePresence().catch(console.error), presSec * 1000);
 });
 
