@@ -94,7 +94,7 @@ async function registerCommands() {
 
   for (const gid of ids) {
     try {
-      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, gid), { body: commands });
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID), { body: commands });
       console.log(`✅ Commands OK en guild ${gid}`);
     } catch (e) {
       // ESTO ES CLAVE: si el bot NO está dentro de ese servidor, te dará 403 Missing Access
